@@ -1,9 +1,200 @@
+# SQLite 스터디 그룹 회원 관리 DB
+
+## 1. 시나리오
+
+대학교 스터디 그룹의 회원 정보를 저장하고 관리하는 데이터베이스를 만든다. 회원의 학번, 이름, 학과, 학년, 관심 분야를 저장하며, 이름·학과·관심 분야에 검색어가 포함된 회원을 찾을 수 있다.
+
+## 2. 테이블 설계
+
+### `members` 테이블
+
+| 컬럼 | 자료형 | 설명 |
+|---|---|---|
+| `student_id` | TEXT | 학번, 기본 키 |
+| `name` | TEXT | 회원 이름 |
+| `department` | TEXT | 학과 |
+| `grade` | INTEGER | 학년 |
+| `interest` | TEXT | 관심 분야 |
+
+`student_id`를 기본 키로 지정해 회원을 구분한다. 실제 개인정보 대신 예시 데이터를 사용한다.
+
+## 3. Visual Studio Community 준비
+
+1. Visual Studio에서 **콘솔 앱(C)** 프로젝트를 만든다.
+2. SQLite 공식 사이트에서 **sqlite-amalgamation** 압축 파일을 내려받아 `sqlite3.c`와 `sqlite3.h`를 프로젝트에 추가한다. 두 파일은 C 소스 파일과 같은 프로젝트에 둔다.
+3. 아래 코드를 `study_group.c`로 추가한다. 프로젝트 속성에서 C 언어 표준을 **C11**로 설정하고, 소스 및 실행 문자 집합을 UTF-8로 설정하면 한글 입출력이 잘 표시된다. 필요하면 콘솔에서 `chcp 65001`을 실행한 뒤 프로그램을 실행한다.
+
+> SQLite를 별도로 설치하는 대신 `sqlite3.c`를 프로젝트에 함께 빌드하는 방식이다. Visual Studio 프로젝트와 SQLite 파일의 빌드 구성을 모두 x64 또는 모두 x86으로 맞춘다.
+
+## 4. C 구현 코드
+
+```c
 #include <stdio.h>
+#include <string.h>
 #include "sqlite3.h"
 
-void main() {
-    sqlite3* db;
-    if (sqlite3_open("test.db", &db) == SQLITE_OK)
-        printf("SQLite connection successful! Version: %s\n", sqlite3_libversion());
-    sqlite3_close(db);
+typedef struct {
+    const char *student_id;
+    const char *name;
+    const char *department;
+    int grade;
+    const char *interest;
+} Member;
+
+static int execute_sql(sqlite3 *db, const char *sql)
+{
+    char *error_message = NULL;
+    int result = sqlite3_exec(db, sql, NULL, NULL, &error_message);
+
+    if (result != SQLITE_OK) {
+        fprintf(stderr, "SQL 오류: %s\n",
+                error_message ? error_message : sqlite3_errmsg(db));
+        sqlite3_free(error_message);
+    }
+    return result;
 }
+
+int main(void)
+{
+    sqlite3 *db = NULL;
+    sqlite3_stmt *insert_statement = NULL;
+    sqlite3_stmt *search_statement = NULL;
+    int result;
+    int exit_code = 0;
+
+    result = sqlite3_open("study_group.db", &db);
+    if (result != SQLITE_OK) {
+        fprintf(stderr, "데이터베이스 열기 실패: %s\n",
+                db ? sqlite3_errmsg(db) : "SQLite 초기화 실패");
+        if (db) sqlite3_close(db);
+        return 1;
+    }
+
+    if (execute_sql(db,
+        "CREATE TABLE IF NOT EXISTS members ("
+        "student_id TEXT PRIMARY KEY,"
+        "name TEXT NOT NULL,"
+        "department TEXT NOT NULL,"
+        "grade INTEGER NOT NULL,"
+        "interest TEXT)" ) != SQLITE_OK) {
+        sqlite3_close(db);
+        return 1;
+    }
+
+    /* 실행할 때마다 같은 학번의 데이터가 중복 저장되지 않도록 한다. */
+    const Member members[] = {
+        {"2026001", "김민준", "컴퓨터공학과", 1, "파이썬"},
+        {"2026002", "이서연", "경영학과", 2, "데이터 분석"},
+        {"2026003", "박지훈", "컴퓨터공학과", 3, "인공지능"},
+        {"2026004", "최유진", "디자인학과", 1, "웹 디자인"},
+        {"2026005", "정하늘", "수학과", 2, "데이터 분석"}
+    };
+    const int member_count = (int)(sizeof(members) / sizeof(members[0]));
+
+    const char *insert_sql =
+        "INSERT OR IGNORE INTO members "
+        "(student_id, name, department, grade, interest) "
+        "VALUES (?, ?, ?, ?, ?)";
+
+    result = sqlite3_prepare_v2(db, insert_sql, -1, &insert_statement, NULL);
+    if (result != SQLITE_OK) {
+        fprintf(stderr, "INSERT 준비 실패: %s\n", sqlite3_errmsg(db));
+        exit_code = 1;
+        goto cleanup;
+    }
+
+    for (int i = 0; i < member_count; i++) {
+        sqlite3_bind_text(insert_statement, 1, members[i].student_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(insert_statement, 2, members[i].name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(insert_statement, 3, members[i].department, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(insert_statement, 4, members[i].grade);
+        sqlite3_bind_text(insert_statement, 5, members[i].interest, -1, SQLITE_TRANSIENT);
+
+        result = sqlite3_step(insert_statement);
+        if (result != SQLITE_DONE) {
+            fprintf(stderr, "회원 데이터 입력 실패: %s\n", sqlite3_errmsg(db));
+            exit_code = 1;
+            goto cleanup;
+        }
+        sqlite3_reset(insert_statement);
+        sqlite3_clear_bindings(insert_statement);
+    }
+
+    {
+        char keyword[256];
+        char search_pattern[sizeof(keyword) + 3];
+        const char *search_sql =
+            "SELECT student_id, name, department, grade, interest "
+            "FROM members "
+            "WHERE name LIKE ? OR department LIKE ? OR interest LIKE ? "
+            "ORDER BY student_id";
+        int found = 0;
+
+        printf("검색어를 입력하세요 (이름, 학과, 관심 분야): ");
+        if (fgets(keyword, sizeof(keyword), stdin) == NULL) {
+            fprintf(stderr, "검색어 입력을 읽지 못했습니다.\n");
+            exit_code = 1;
+            goto cleanup;
+        }
+        keyword[strcspn(keyword, "\r\n")] = '\0';
+        if (keyword[0] == '\0') {
+            printf("검색어를 입력해야 합니다.\n");
+            exit_code = 1;
+            goto cleanup;
+        }
+
+        snprintf(search_pattern, sizeof(search_pattern), "%%%s%%", keyword);
+        result = sqlite3_prepare_v2(db, search_sql, -1, &search_statement, NULL);
+        if (result != SQLITE_OK) {
+            fprintf(stderr, "검색 쿼리 준비 실패: %s\n", sqlite3_errmsg(db));
+            exit_code = 1;
+            goto cleanup;
+        }
+
+        sqlite3_bind_text(search_statement, 1, search_pattern, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(search_statement, 2, search_pattern, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(search_statement, 3, search_pattern, -1, SQLITE_TRANSIENT);
+
+        printf("\n'%s' 검색 결과\n", keyword);
+        printf("-------------------------------------------------------------\n");
+        while ((result = sqlite3_step(search_statement)) == SQLITE_ROW) {
+            printf("학번: %s, 이름: %s, 학과: %s, 학년: %d, 관심 분야: %s\n",
+                (const char *)sqlite3_column_text(search_statement, 0),
+                (const char *)sqlite3_column_text(search_statement, 1),
+                (const char *)sqlite3_column_text(search_statement, 2),
+                sqlite3_column_int(search_statement, 3),
+                (const char *)sqlite3_column_text(search_statement, 4));
+            found++;
+        }
+        if (result != SQLITE_DONE) {
+            fprintf(stderr, "검색 실행 실패: %s\n", sqlite3_errmsg(db));
+            exit_code = 1;
+            goto cleanup;
+        }
+        if (found == 0) {
+            printf("해당하는 회원이 없습니다.\n");
+        }
+    }
+
+cleanup:
+    sqlite3_finalize(search_statement);
+    sqlite3_finalize(insert_statement);
+    sqlite3_close(db);
+    return exit_code;
+}
+```
+
+## 5. 실행 및 검색 예시
+
+Visual Studio에서 **빌드 → 솔루션 빌드** 후 프로그램을 실행하고 `컴퓨터`를 입력한다. `study_group.db` 파일은 실행 작업 디렉터리에 생성된다.
+
+```text
+검색어를 입력하세요 (이름, 학과, 관심 분야): 컴퓨터
+
+'컴퓨터' 검색 결과
+-------------------------------------------------------------
+학번: 2026001, 이름: 김민준, 학과: 컴퓨터공학과, 학년: 1, 관심 분야: 파이썬
+학번: 2026003, 이름: 박지훈, 학과: 컴퓨터공학과, 학년: 3, 관심 분야: 인공지능
+```
+
+`데이터 분석`을 검색하면 이서연과 정하늘이 검색된다. SQL의 `?` 매개변수에 검색값을 바인딩하므로 입력값을 쿼리 문자열에 직접 이어 붙이지 않는다.

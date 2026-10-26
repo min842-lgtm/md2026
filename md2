@@ -1,0 +1,9 @@
+#include <stdio.h>
+#include "sqlite3.h"
+
+void main() {
+    sqlite3* db;
+    if (sqlite3_open("test.db", &db) == SQLITE_OK)
+        printf("SQLite connection successful! Version: %s\n", sqlite3_libversion());
+    sqlite3_close(db);
+}

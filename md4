@@ -1,0 +1,30 @@
+#include <stdio.h>
+
+int main(void)
+{
+    int n;
+
+    printf("Enter height N: ");
+    if (scanf_s("%d", &n) != 1 || n <= 0) {
+        printf("Please enter a positive integer.\n");
+        return 1;
+    }
+
+    for (int i = 1; i <= n; i++) {
+        char ch = (i % 2 == 1) ? '*' : '#';   /* odd row: *, even row: # */
+
+        /* leading spaces for center alignment */
+        for (int s = 0; s < n - i; s++) {
+            putchar(' ');
+        }
+
+        /* 2*i - 1 characters in row i */
+        for (int k = 0; k < 2 * i - 1; k++) {
+            putchar(ch);
+        }
+
+        putchar('\n');
+    }
+
+    return 0;
+}

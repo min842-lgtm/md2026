@@ -1,0 +1,455 @@
+/*
+ * 무지개 벽돌깨기 (Rainbow Breakout)
+ * 그래픽 라이브러리: raylib (4.x / 5.x)
+ *
+ * 조작법
+ *   ← / → (또는 A / D) : 패들 이동
+ *   SPACE              : 공 발사
+ *   P                  : 일시정지 / 재개
+ *   R                  : 게임오버·클리어 후 재시작
+ */
+#include "raylib.h"
+#include <math.h>
+#include <stdbool.h>
+
+/* ---------------- 상수 ---------------- */
+#define SCREEN_W        800
+#define SCREEN_H        600
+#define HUD_H           40          /* 상단 점수판 높이(천장 역할) */
+
+#define BRICK_ROWS      7           /* 빨주노초파남보 7줄 */
+#define BRICK_COLS      10
+#define BRICK_GAP       4
+#define BRICK_TOP       70
+#define BRICK_H         22
+
+#define PADDLE_W        110
+#define PADDLE_H        14
+#define PADDLE_SPEED    560.0f
+
+#define BALL_RADIUS     8
+#define BALL_SPEED      360.0f
+#define BALL_MAX_SPEED  700.0f
+#define MAX_BOUNCE_DEG  60.0f       /* 패들 끝에 맞았을 때 최대 반사각 */
+
+#define MAX_LIVES       3
+#define MAX_PARTICLES   400
+#define PARTICLES_PER_BRICK 14
+#define SUBSTEPS        4           /* 빠른 공이 벽돌을 뚫고 지나가는 것 방지 */
+
+/* ---------------- 자료형 ---------------- */
+typedef struct {
+    Rectangle rect;
+    Color     color;
+    bool      alive;
+    int       points;
+} Brick;
+
+typedef struct {
+    Vector2 pos;
+    Vector2 vel;
+    float   radius;
+    bool    launched;
+} Ball;
+
+typedef struct {
+    Vector2 pos;
+    Vector2 vel;
+    Color   color;
+    float   life;       /* 1.0 → 0.0 */
+    bool    active;
+} Particle;
+
+typedef enum {
+    STATE_PLAYING,
+    STATE_PAUSED,
+    STATE_GAMEOVER,
+    STATE_CLEAR
+} GameState;
+
+/* 무지개 7색 (빨, 주, 노, 초, 파, 남, 보) */
+static const Color RAINBOW[BRICK_ROWS] = {
+    { 255,  50,  50, 255 },
+    { 255, 140,   0, 255 },
+    { 255, 230,   0, 255 },
+    {  40, 200,  70, 255 },
+    {  30, 130, 255, 255 },
+    {  90,  70, 210, 255 },
+    { 170,  70, 230, 255 }
+};
+
+/* ---------------- 전역 상태 ---------------- */
+static Brick     bricks[BRICK_ROWS][BRICK_COLS];
+static Particle  particles[MAX_PARTICLES];
+static Rectangle paddle;
+static Ball      ball;
+static GameState state;
+static int       score;
+static int       lives;
+static int       bricksLeft;
+static float     hueTime;           /* 무지개 색 순환용 시간값 */
+
+/* ---------------- 유틸 ---------------- */
+static float Clampf(float v, float lo, float hi)
+{
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static float VecLength(Vector2 v)
+{
+    return sqrtf(v.x * v.x + v.y * v.y);
+}
+
+static Color Lighten(Color c, float amount)  /* amount: 0~1 */
+{
+    Color r;
+    r.r = (unsigned char)(c.r + (255 - c.r) * amount);
+    r.g = (unsigned char)(c.g + (255 - c.g) * amount);
+    r.b = (unsigned char)(c.b + (255 - c.b) * amount);
+    r.a = c.a;
+    return r;
+}
+
+/* 글자마다 색이 다른 무지개 텍스트 */
+static void DrawRainbowText(const char *text, int x, int y, int size, float hueOffset)
+{
+    char buf[2] = { 0, 0 };
+    for (int i = 0; text[i] != '\0'; i++) {
+        buf[0] = text[i];
+        Color c = ColorFromHSV(fmodf(hueOffset + i * 25.0f, 360.0f), 0.75f, 1.0f);
+        DrawText(buf, x, y, size, c);
+        x += MeasureText(buf, size) + size / 10;
+    }
+}
+
+static void DrawCenteredText(const char *text, int y, int size, Color color)
+{
+    DrawText(text, (SCREEN_W - MeasureText(text, size)) / 2, y, size, color);
+}
+
+/* ---------------- 초기화 ---------------- */
+static void InitBricks(void)
+{
+    float bw = (SCREEN_W - BRICK_GAP * (BRICK_COLS + 1)) / (float)BRICK_COLS;
+    bricksLeft = 0;
+
+    for (int r = 0; r < BRICK_ROWS; r++) {
+        for (int c = 0; c < BRICK_COLS; c++) {
+            Brick *b = &bricks[r][c];
+            b->rect = (Rectangle){
+                BRICK_GAP + c * (bw + BRICK_GAP),
+                BRICK_TOP + r * (BRICK_H + BRICK_GAP),
+                bw,
+                BRICK_H
+            };
+            b->color  = RAINBOW[r];
+            b->alive  = true;
+            b->points = (BRICK_ROWS - r) * 10;   /* 위쪽 줄일수록 고득점 */
+            bricksLeft++;
+        }
+    }
+}
+
+static void ResetBall(void)
+{
+    ball.radius   = BALL_RADIUS;
+    ball.launched = false;
+    ball.vel      = (Vector2){ 0, 0 };
+    ball.pos      = (Vector2){ paddle.x + paddle.width / 2.0f,
+                               paddle.y - ball.radius - 1.0f };
+}
+
+static void LaunchBall(void)
+{
+    float angle = GetRandomValue(-30, 30) * DEG2RAD;
+    ball.vel.x    = BALL_SPEED * sinf(angle);
+    ball.vel.y    = -BALL_SPEED * cosf(angle);
+    ball.launched = true;
+}
+
+static void ResetGame(void)
+{
+    paddle = (Rectangle){ (SCREEN_W - PADDLE_W) / 2.0f, SCREEN_H - 50.0f,
+                          PADDLE_W, PADDLE_H };
+    score = 0;
+    lives = MAX_LIVES;
+    InitBricks();
+    ResetBall();
+    for (int i = 0; i < MAX_PARTICLES; i++) particles[i].active = false;
+    state = STATE_PLAYING;
+}
+
+/* ---------------- 파티클 ---------------- */
+static void SpawnParticles(Vector2 at, Color color)
+{
+    int spawned = 0;
+    for (int i = 0; i < MAX_PARTICLES && spawned < PARTICLES_PER_BRICK; i++) {
+        if (particles[i].active) continue;
+        float angle = GetRandomValue(0, 359) * DEG2RAD;
+        float speed = (float)GetRandomValue(60, 240);
+        particles[i].pos    = at;
+        particles[i].vel    = (Vector2){ cosf(angle) * speed, sinf(angle) * speed };
+        particles[i].color  = color;
+        particles[i].life   = 1.0f;
+        particles[i].active = true;
+        spawned++;
+    }
+}
+
+static void UpdateParticles(float dt)
+{
+    for (int i = 0; i < MAX_PARTICLES; i++) {
+        Particle *p = &particles[i];
+        if (!p->active) continue;
+        p->pos.x += p->vel.x * dt;
+        p->pos.y += p->vel.y * dt;
+        p->vel.y += 450.0f * dt;               /* 중력 */
+        p->life  -= dt * 1.4f;
+        if (p->life <= 0.0f) p->active = false;
+    }
+}
+
+/* ---------------- 충돌 처리 ---------------- */
+static void HandlePaddleCollision(void)
+{
+    if (ball.vel.y <= 0) return;                         /* 내려올 때만 */
+    if (!CheckCollisionCircleRec(ball.pos, ball.radius, paddle)) return;
+
+    /* 패들 중앙 기준 맞은 위치(-1 ~ 1)에 따라 반사각 결정 */
+    float center = paddle.x + paddle.width / 2.0f;
+    float offset = Clampf((ball.pos.x - center) / (paddle.width / 2.0f), -1.0f, 1.0f);
+    float angle  = offset * MAX_BOUNCE_DEG * DEG2RAD;
+    float speed  = VecLength(ball.vel);
+
+    ball.vel.x = speed * sinf(angle);
+    ball.vel.y = -speed * cosf(angle);
+    ball.pos.y = paddle.y - ball.radius - 0.5f;
+}
+
+static void HandleBrickCollision(void)
+{
+    for (int r = 0; r < BRICK_ROWS; r++) {
+        for (int c = 0; c < BRICK_COLS; c++) {
+            Brick *b = &bricks[r][c];
+            if (!b->alive) continue;
+            if (!CheckCollisionCircleRec(ball.pos, ball.radius, b->rect)) continue;
+
+            /* 네 방향 겹침량을 비교해 어느 면에 맞았는지 판단 */
+            float overlapL = (ball.pos.x + ball.radius) - b->rect.x;
+            float overlapR = (b->rect.x + b->rect.width) - (ball.pos.x - ball.radius);
+            float overlapT = (ball.pos.y + ball.radius) - b->rect.y;
+            float overlapB = (b->rect.y + b->rect.height) - (ball.pos.y - ball.radius);
+            float minX = fminf(overlapL, overlapR);
+            float minY = fminf(overlapT, overlapB);
+
+            if (minX < minY) {               /* 좌/우 면 */
+                if (overlapL < overlapR) { ball.pos.x -= overlapL; ball.vel.x = -fabsf(ball.vel.x); }
+                else                     { ball.pos.x += overlapR; ball.vel.x =  fabsf(ball.vel.x); }
+            } else {                         /* 위/아래 면 */
+                if (overlapT < overlapB) { ball.pos.y -= overlapT; ball.vel.y = -fabsf(ball.vel.y); }
+                else                     { ball.pos.y += overlapB; ball.vel.y =  fabsf(ball.vel.y); }
+            }
+
+            b->alive = false;
+            bricksLeft--;
+            score += b->points;
+            SpawnParticles((Vector2){ b->rect.x + b->rect.width / 2.0f,
+                                      b->rect.y + b->rect.height / 2.0f }, b->color);
+
+            /* 벽돌을 깰 때마다 공이 조금씩 빨라짐 */
+            float s = VecLength(ball.vel);
+            if (s > 0.0f && s < BALL_MAX_SPEED) {
+                float ns = fminf(s * 1.02f, BALL_MAX_SPEED);
+                ball.vel.x *= ns / s;
+                ball.vel.y *= ns / s;
+            }
+            return;                          /* 한 스텝에 벽돌 하나만 처리 */
+        }
+    }
+}
+
+/* ---------------- 업데이트 ---------------- */
+static void UpdatePaddle(float dt)
+{
+    if (IsKeyDown(KEY_LEFT)  || IsKeyDown(KEY_A)) paddle.x -= PADDLE_SPEED * dt;
+    if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D)) paddle.x += PADDLE_SPEED * dt;
+    paddle.x = Clampf(paddle.x, 0.0f, SCREEN_W - paddle.width);
+}
+
+static void UpdateBall(float dt)
+{
+    float step = dt / SUBSTEPS;
+
+    for (int i = 0; i < SUBSTEPS; i++) {
+        ball.pos.x += ball.vel.x * step;
+        ball.pos.y += ball.vel.y * step;
+
+        /* 벽 반사 */
+        if (ball.pos.x - ball.radius < 0)        { ball.pos.x = ball.radius;            ball.vel.x =  fabsf(ball.vel.x); }
+        if (ball.pos.x + ball.radius > SCREEN_W) { ball.pos.x = SCREEN_W - ball.radius; ball.vel.x = -fabsf(ball.vel.x); }
+        if (ball.pos.y - ball.radius < HUD_H)    { ball.pos.y = HUD_H + ball.radius;    ball.vel.y =  fabsf(ball.vel.y); }
+
+        HandlePaddleCollision();
+        HandleBrickCollision();
+
+        /* 바닥으로 떨어짐 */
+        if (ball.pos.y - ball.radius > SCREEN_H) {
+            lives--;
+            if (lives <= 0) state = STATE_GAMEOVER;
+            else            ResetBall();
+            return;
+        }
+
+        /* 모든 벽돌 파괴 */
+        if (bricksLeft == 0) {
+            state = STATE_CLEAR;
+            return;
+        }
+    }
+}
+
+static void UpdateGame(void)
+{
+    float dt = GetFrameTime();
+    if (dt > 1.0f / 30.0f) dt = 1.0f / 30.0f;   /* 프레임 급락 시 튐 방지 */
+
+    switch (state) {
+    case STATE_PLAYING:
+        hueTime += dt * 60.0f;
+        if (IsKeyPressed(KEY_P)) { state = STATE_PAUSED; break; }
+
+        UpdatePaddle(dt);
+        if (!ball.launched) {
+            ResetBall();                          /* 발사 전엔 패들 위에 붙어 다님 */
+            if (IsKeyPressed(KEY_SPACE)) LaunchBall();
+        } else {
+            UpdateBall(dt);
+        }
+        UpdateParticles(dt);
+        break;
+
+    case STATE_PAUSED:
+        if (IsKeyPressed(KEY_P)) state = STATE_PLAYING;
+        break;
+
+    case STATE_GAMEOVER:
+    case STATE_CLEAR:
+        hueTime += dt * 60.0f;
+        UpdateParticles(dt);
+        if (IsKeyPressed(KEY_R) || IsKeyPressed(KEY_ENTER)) ResetGame();
+        break;
+    }
+}
+
+/* ---------------- 그리기 ---------------- */
+static void DrawHUD(void)
+{
+    DrawRectangle(0, 0, SCREEN_W, HUD_H, (Color){ 25, 25, 45, 255 });
+    DrawLine(0, HUD_H, SCREEN_W, HUD_H, Fade(WHITE, 0.3f));
+
+    DrawText(TextFormat("SCORE: %d", score), 15, 10, 22, RAYWHITE);
+
+    const char *title = "RAINBOW BREAKOUT";
+    int tw = MeasureText(title, 22);
+    DrawRainbowText(title, (SCREEN_W - tw) / 2, 10, 22, hueTime);
+
+    for (int i = 0; i < lives; i++) {
+        DrawCircle(SCREEN_W - 25 - i * 24, HUD_H / 2, 7,
+                   ColorFromHSV(fmodf(i * 120.0f + hueTime, 360.0f), 0.7f, 1.0f));
+    }
+}
+
+static void DrawBricks(void)
+{
+    for (int r = 0; r < BRICK_ROWS; r++) {
+        for (int c = 0; c < BRICK_COLS; c++) {
+            Brick *b = &bricks[r][c];
+            if (!b->alive) continue;
+            DrawRectangleRec(b->rect, b->color);
+            /* 윗면 하이라이트로 입체감 */
+            DrawRectangle((int)b->rect.x, (int)b->rect.y, (int)b->rect.width, 5,
+                          Lighten(b->color, 0.45f));
+            DrawRectangleLinesEx(b->rect, 1.0f, Fade(BLACK, 0.35f));
+        }
+    }
+}
+
+static void DrawPaddleAndBall(void)
+{
+    /* 무지개 그라데이션 패들 */
+    Color left  = ColorFromHSV(fmodf(hueTime, 360.0f), 0.8f, 1.0f);
+    Color right = ColorFromHSV(fmodf(hueTime + 150.0f, 360.0f), 0.8f, 1.0f);
+    DrawRectangleGradientH((int)paddle.x, (int)paddle.y,
+                           (int)paddle.width, (int)paddle.height, left, right);
+
+    /* 색이 계속 바뀌는 공 + 은은한 광채 */
+    Color ballColor = ColorFromHSV(fmodf(hueTime * 2.0f, 360.0f), 0.6f, 1.0f);
+    DrawCircleV(ball.pos, ball.radius * 2.0f, Fade(ballColor, 0.15f));
+    DrawCircleV(ball.pos, ball.radius, ballColor);
+}
+
+static void DrawParticles(void)
+{
+    for (int i = 0; i < MAX_PARTICLES; i++) {
+        if (!particles[i].active) continue;
+        DrawRectangleV(particles[i].pos, (Vector2){ 4, 4 },
+                       Fade(particles[i].color, particles[i].life));
+    }
+}
+
+static void DrawOverlay(void)
+{
+    if (state == STATE_PLAYING && !ball.launched) {
+        DrawCenteredText("Press SPACE to launch", SCREEN_H / 2 + 60, 20, Fade(RAYWHITE, 0.8f));
+        return;
+    }
+    if (state == STATE_PLAYING) return;
+
+    DrawRectangle(0, 0, SCREEN_W, SCREEN_H, Fade(BLACK, 0.55f));
+
+    if (state == STATE_PAUSED) {
+        DrawCenteredText("PAUSED", SCREEN_H / 2 - 30, 48, RAYWHITE);
+        DrawCenteredText("Press P to resume", SCREEN_H / 2 + 30, 20, LIGHTGRAY);
+    } else if (state == STATE_GAMEOVER) {
+        DrawCenteredText("GAME OVER", SCREEN_H / 2 - 50, 52, (Color){ 255, 80, 80, 255 });
+        DrawCenteredText(TextFormat("Final Score: %d", score), SCREEN_H / 2 + 15, 26, RAYWHITE);
+        DrawCenteredText("Press R to restart", SCREEN_H / 2 + 55, 20, LIGHTGRAY);
+    } else if (state == STATE_CLEAR) {
+        const char *msg = "YOU WIN!";
+        int w = MeasureText(msg, 56);
+        DrawRainbowText(msg, (SCREEN_W - w) / 2, SCREEN_H / 2 - 55, 56, hueTime * 3.0f);
+        DrawCenteredText(TextFormat("Final Score: %d", score), SCREEN_H / 2 + 15, 26, RAYWHITE);
+        DrawCenteredText("Press R to play again", SCREEN_H / 2 + 55, 20, LIGHTGRAY);
+    }
+}
+
+static void DrawGame(void)
+{
+    BeginDrawing();
+    ClearBackground((Color){ 12, 12, 28, 255 });
+
+    DrawBricks();
+    DrawParticles();
+    DrawPaddleAndBall();
+    DrawHUD();
+    DrawOverlay();
+
+    EndDrawing();
+}
+
+/* ---------------- main ---------------- */
+int main(void)
+{
+    InitWindow(SCREEN_W, SCREEN_H, "Rainbow Breakout - raylib");
+    SetTargetFPS(60);
+
+    ResetGame();
+
+    while (!WindowShouldClose()) {
+        UpdateGame();
+        DrawGame();
+    }
+
+    CloseWindow();
+    return 0;
+}
